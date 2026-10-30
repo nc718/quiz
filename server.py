@@ -11,6 +11,7 @@ DATA.mkdir(exist_ok=True)
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN") or secrets.token_urlsafe(32)
 API_TOKEN = os.getenv("API_TOKEN") or secrets.token_urlsafe(32)
 APP = Flask(__name__)
+CORS(APP)
 APP.config["MAX_CONTENT_LENGTH"] = 3 * 1024 * 1024
 LOCK = threading.RLock()
 SIGNAL = threading.Condition(LOCK)
@@ -437,11 +438,17 @@ with LOCK:
 threading.Thread(target=scheduler,daemon=True).start()
 
 if __name__=="__main__":
-    print("\nQviz — Python 3.10+")
+    print("\n=== SERVER STARTING ===")
+    print("Qviz — Python 3.10+")
     print("ADMIN_TOKEN =",ADMIN_TOKEN)
     print("API_TOKEN   =",API_TOKEN)
-    print("Open http://127.0.0.1:"+os.getenv("PORT","8000"))
+    host=os.getenv("HOST","0.0.0.0")
+    port=os.getenv("PORT","8000")
+    print("HOST =", host)
+    print("PORT =", port)
+    print("Open http://127.0.0.1:"+port if host=="0.0.0.0" else f"Open http://{host}:{port}")
     print("Use an HTTPS reverse proxy for external telephony access.\n")
+    print("=== STARTING SERVER ===")
     # תהליך אחד, מספר threads. אין להפעיל כמה workers עם מצב המשחק הזה.
     serve(APP,host=os.getenv("HOST","0.0.0.0"),
           port=int(os.getenv("PORT","8000")),threads=16)
