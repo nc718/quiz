@@ -402,7 +402,7 @@ def phone():
         # טיפול בניתוק
         if payload.get("hangup")=="yes":
             leave(pid)
-            persist()
+            changed(True)
             return plain("OK")
         raw=payload.get("answer")
         if raw is None or str(raw).strip()=="":
