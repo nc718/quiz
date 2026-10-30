@@ -49,7 +49,7 @@ def sample_questions():
 
 def fresh():
     return dict(revision=0, settings=dict(title="ערב טריוויה",defaultTime=20,
-        defaultPoints=100,transition="manual",transitionDelay=5,autoReveal=False,
+        defaultPoints=100,transition="manual",transitionDelay=5,autoReveal=True,
         revealDelay=1.2,shuffle=False,maskPhones=False,
         phoneNumber="077-000-0000",phoneKey=secrets.token_urlsafe(20)),
         questions=sample_questions(),players=[],scores={},answers={},
