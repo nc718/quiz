@@ -443,5 +443,5 @@ if __name__=="__main__":
     print("Open http://127.0.0.1:"+os.getenv("PORT","8000"))
     print("Use an HTTPS reverse proxy for external telephony access.\n")
     # תהליך אחד, מספר threads. אין להפעיל כמה workers עם מצב המשחק הזה.
-    serve(APP,host=os.getenv("HOST","127.0.0.1"),
+    serve(APP,host=os.getenv("HOST","0.0.0.0"),
           port=int(os.getenv("PORT","8000")),threads=16)
