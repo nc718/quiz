@@ -1,12 +1,13 @@
 <!DOCTYPE html>
-<html lang="he" dir="rtl"><head>
+<html lang="he" dir="rtl">
+<head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta name="theme-color" content="#7060ef">
 <title>קליק — סטודיו למשחקים חיים</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="">
-<link href="https://fonts.googleapis.com/css2?family=Heebo:wght@400;500;600;700;800;900&amp;display=swap" rel="stylesheet">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Heebo:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
 <style>
@@ -340,7 +341,7 @@ body.stage-open{overflow:hidden}
 <div class="shell" id="app">
   <aside class="sidebar">
     <div class="brand">
-      <div class="brand-mark"><svg width="26" height="26" viewBox="0 0 28 28" fill="none"><rect x="3" y="3" width="9" height="9" rx="3" fill="#fff"></rect><rect x="16" y="3" width="9" height="9" rx="3" fill="#D9F98B"></rect><rect x="3" y="16" width="9" height="9" rx="3" fill="#D9F98B"></rect><path d="M17 16L25 20.5L17 25V16Z" fill="white"></path></svg></div>
+      <div class="brand-mark"><svg width="26" height="26" viewBox="0 0 28 28" fill="none"><rect x="3" y="3" width="9" height="9" rx="3" fill="#fff"/><rect x="16" y="3" width="9" height="9" rx="3" fill="#D9F98B"/><rect x="3" y="16" width="9" height="9" rx="3" fill="#D9F98B"/><path d="M17 16L25 20.5L17 25V16Z" fill="white"/></svg></div>
       <div class="brand-text"><div class="brand-name">קליק<span style="color:var(--purple)">.</span></div><div class="brand-sub">LIVE GAME STUDIO</div></div>
     </div>
     <div class="nav-caption">סביבת המשחק</div>
@@ -381,10 +382,10 @@ body.stage-open{overflow:hidden}
     <div class="content" id="content"></div>
   </main>
 </div>
-<section class="stage" id="stage" hidden="" aria-label="מסך הקהל והמשחק"></section>
+<section class="stage" id="stage" hidden aria-label="מסך הקהל והמשחק"></section>
 <div id="modalRoot"></div>
 <div class="toast" id="toast" role="status"></div>
-<input type="file" id="fileInput" hidden="" accept=".xlsx,.xls,.csv,.json">
+<input type="file" id="fileInput" hidden accept=".xlsx,.xls,.csv,.json">
 
 <!-- Downloadable, functional Python server. Save through the “ערכת שרת” button. -->
 <script id="pythonSource" type="text/plain">
@@ -439,7 +440,7 @@ def sample_questions():
 
 def fresh():
     return dict(revision=0, settings=dict(title="ערב טריוויה",defaultTime=20,
-        defaultPoints=100,transition="manual",transitionDelay=5,autoReveal=False,
+        defaultPoints=100,transition="manual",transitionDelay=5,autoReveal=True,
         revealDelay=1.2,shuffle=False,maskPhones=False,
         phoneNumber="077-000-0000",phoneKey=secrets.token_urlsafe(20)),
         questions=sample_questions(),players=[],scores={},answers={},
@@ -940,7 +941,7 @@ function questionsSeed(){return [
 ]}
 function seed(){
 const names=["נועה לוי","איתי כהן","שירה ישראלי","דניאל מזרחי","מאיה אברהם","יונתן פרץ","רוני לוי","תמר גולן","עידו שפירא","איילה רז","אורי דוד","ליהי שחר"];
-return {revision:1,settings:{title:"ערב טריוויה",defaultTime:20,defaultPoints:100,transition:"manual",transitionDelay:5,autoReveal:false,revealDelay:1.2,shuffle:false,maskPhones:false,phoneNumber:"077-000-0000",phoneKey:"demo-key-2026"},
+return {revision:1,settings:{title:"ערב טריוויה",defaultTime:20,defaultPoints:100,transition:"manual",transitionDelay:5,autoReveal:true,revealDelay:1.2,shuffle:false,maskPhones:false,phoneNumber:"077-000-0000",phoneKey:"demo-key-2026"},
 questions:questionsSeed(),players:names.map((name,i)=>({id:"05012345"+String(i).padStart(2,"0"),name,connected:true,joinedAt:Date.now()-i*1400,lastSeen:Date.now()})),scores:{},answers:{},game:gameFresh(),history:[]}
 }
 function load(){try{const s=JSON.parse(localStorage.getItem(STORE));if(s&&s.game&&s.settings&&Array.isArray(s.questions))return s}catch(e){}return seed()}
@@ -1583,4 +1584,6 @@ document.querySelectorAll("[data-icon]").forEach(e=>e.innerHTML=ic(e.dataset.ico
 render();
 if(new URLSearchParams(location.search).get("audience")==="1"||location.hash==="#audience")showStage();
 detectServer();
-</script></body></html>
+</script>
+</body>
+</html>
