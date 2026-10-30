@@ -296,7 +296,7 @@ def headers(response):
 
 @APP.get("/")
 def index():
-    return send_file(BASE/"index.html")
+    return "Hello from Qviz server!"
 @APP.get("/api/state")
 def state_public():
     with LOCK: return jsonify(public_state())
@@ -393,6 +393,14 @@ def phone():
         if len(RATE)>20000:
             for key in list(RATE):
                 if not RATE[key] or t-RATE[key][-1]>10000: del RATE[key]
+        # בדיקה אם זה hangup
+        hangup=payload.get("hangup")
+        if hangup=="yes":
+            # מחק את המספר מרשימת המחוברים, אבל שמור את הניקוד
+            DB.execute("DELETE FROM joined WHERE run=? AND id=?",(RT["run_id"],pid))
+            event("leave","עזיבה · "+player_name(pid))
+            persist()
+            return plain("OK")
         raw=payload.get("answer")
         if raw is None or str(raw).strip()=="":
             if not may_join(pid): return plain("ERROR")
