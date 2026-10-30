@@ -11,7 +11,6 @@ DATA.mkdir(exist_ok=True)
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN") or secrets.token_urlsafe(32)
 API_TOKEN = os.getenv("API_TOKEN") or secrets.token_urlsafe(32)
 APP = Flask(__name__)
-CORS(APP)
 APP.config["MAX_CONTENT_LENGTH"] = 3 * 1024 * 1024
 LOCK = threading.RLock()
 SIGNAL = threading.Condition(LOCK)
