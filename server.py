@@ -286,6 +286,12 @@ def join(pid):
         DB.execute("INSERT INTO joined VALUES(?,?,?)",(RT["run_id"],pid,now_ms()))
         event("join","הצטרפות · "+player_name(pid))
 
+def leave(pid):
+    found=DB.execute("SELECT 1 FROM joined WHERE run=? AND id=?",(RT["run_id"],pid)).fetchone()
+    if found:
+        DB.execute("DELETE FROM joined WHERE run=? AND id=?",(RT["run_id"],pid))
+        event("leave","ניתוק · "+player_name(pid))
+
 @APP.after_request
 def headers(response):
     response.headers["Cache-Control"]="no-store"
@@ -393,6 +399,11 @@ def phone():
         if len(RATE)>20000:
             for key in list(RATE):
                 if not RATE[key] or t-RATE[key][-1]>10000: del RATE[key]
+        # טיפול בניתוק
+        if payload.get("hangup")=="yes":
+            leave(pid)
+            persist()
+            return plain("OK")
         raw=payload.get("answer")
         if raw is None or str(raw).strip()=="":
             if not may_join(pid): return plain("ERROR")
