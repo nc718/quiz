@@ -296,7 +296,7 @@ def headers(response):
 
 @APP.get("/")
 def index():
-    return "Hello from Qviz server!"
+    return send_file(BASE/"index.html")
 @APP.get("/api/state")
 def state_public():
     with LOCK: return jsonify(public_state())
@@ -393,14 +393,6 @@ def phone():
         if len(RATE)>20000:
             for key in list(RATE):
                 if not RATE[key] or t-RATE[key][-1]>10000: del RATE[key]
-        # בדיקה אם זה hangup
-        hangup=payload.get("hangup")
-        if hangup=="yes":
-            # מחק את המספר מרשימת המחוברים, אבל שמור את הניקוד
-            DB.execute("DELETE FROM joined WHERE run=? AND id=?",(RT["run_id"],pid))
-            event("leave","עזיבה · "+player_name(pid))
-            persist()
-            return plain("OK")
         raw=payload.get("answer")
         if raw is None or str(raw).strip()=="":
             if not may_join(pid): return plain("ERROR")
@@ -445,17 +437,11 @@ with LOCK:
 threading.Thread(target=scheduler,daemon=True).start()
 
 if __name__=="__main__":
-    print("\n=== SERVER STARTING ===")
-    print("Qviz — Python 3.10+")
+    print("\nQviz — Python 3.10+")
     print("ADMIN_TOKEN =",ADMIN_TOKEN)
     print("API_TOKEN   =",API_TOKEN)
-    host=os.getenv("HOST","0.0.0.0")
-    port=os.getenv("PORT","8000")
-    print("HOST =", host)
-    print("PORT =", port)
-    print("Open http://127.0.0.1:"+port if host=="0.0.0.0" else f"Open http://{host}:{port}")
+    print("Open http://127.0.0.1:"+os.getenv("PORT","8000"))
     print("Use an HTTPS reverse proxy for external telephony access.\n")
-    print("=== STARTING SERVER ===")
     # תהליך אחד, מספר threads. אין להפעיל כמה workers עם מצב המשחק הזה.
-    serve(APP,host=os.getenv("HOST","0.0.0.0"),
+    serve(APP,host=os.getenv("HOST","127.0.0.1"),
           port=int(os.getenv("PORT","8000")),threads=16)
