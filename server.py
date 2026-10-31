@@ -1,485 +1,234 @@
-# -*- coding: utf-8 -*-
-"""קליק: one-process Flask server, SQLite persistence, SSE and phone API."""
-import os, json, time, secrets, sqlite3, threading, copy, csv, io, hashlib, shutil
+import os
+import json
+import time
+import random
+import sqlite3
 from pathlib import Path
-from flask import Flask, request, jsonify, Response, session, send_file, stream_with_context
+from typing import Optional, Dict, Any
+from fastapi import FastAPI, Request, UploadFile, File, WebSocket, WebSocketDisconnect, Query
+from fastapi.responses import PlainTextResponse, JSONResponse, HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
+import pandas as pd
+import uvicorn
 
-ROOT = Path(__file__).resolve().parent
-DATA = ROOT / "data"
-DATA.mkdir(exist_ok=True)
-(DATA / "games").mkdir(exist_ok=True)
+app = FastAPI(title="ClickMaster Pro - Telephony & Web Clicker Server")
 
-def secret_file(name):
-    p = DATA / name
-    if not p.exists():
-        p.write_text(secrets.token_urlsafe(32), encoding="utf-8")
-        try: p.chmod(0o600)
-        except OSError: pass
-    return p.read_text(encoding="utf-8").strip()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-ADMIN_TOKEN = os.environ.get("CLICK_ADMIN_TOKEN") or secret_file(".admin-token")
-app = Flask(__name__)
-app.secret_key = os.environ.get("CLICK_SESSION_SECRET") or secret_file(".session-secret")
-app.config.update(MAX_CONTENT_LENGTH=5*1024*1024, SESSION_COOKIE_HTTPONLY=True,
-                  SESSION_COOKIE_SAMESITE="Strict",
-                  SESSION_COOKIE_SECURE=os.environ.get("COOKIE_SECURE") == "1")
-LOCK = threading.RLock()
-CV = threading.Condition(LOCK)
-db = sqlite3.connect(DATA / "click.db", check_same_thread=False)
-db.execute("PRAGMA journal_mode=WAL")
-db.execute("CREATE TABLE IF NOT EXISTS live (id INTEGER PRIMARY KEY, body TEXT NOT NULL)")
-db.execute("CREATE TABLE IF NOT EXISTS history (id TEXT PRIMARY KEY, body TEXT NOT NULL)")
-db.commit()
-now = lambda: time.time_ns() // 1_000_000
+DATA_DIR = Path("./game_data")
+DATA_DIR.mkdir(exist_ok=True)
+DB_PATH = DATA_DIR / "clickmaster.sqlite"
 
-def new_game():
-    return dict(id="g_"+secrets.token_hex(6), createdAt=now(), phase="lobby",
-                qIndex=0, revealed=0, openedAt=None, closedAt=None, pausedAt=None,
-                pauseTotal=0, nextAt=None, revealAt=None, duration=20, points=100)
+# Active WebSockets per game_code for real-time synchronization
+ws_connections: Dict[str, list[WebSocket]] = {}
 
-def sample_questions():
-    return [
-      dict(id="q1",type="quiz",text="איזה כוכב לכת הוא הקרוב ביותר לשמש?",options=["נוגה","כדור הארץ","כוכב חמה","מאדים"],correct=3,time=20,points=100),
-      dict(id="q2",type="quiz",text="כמה שחקנים יש על המגרש בקבוצת כדורסל?",options=["4","5","6","7"],correct=2,time=None,points=150),
-      dict(id="q3",type="quiz",text="איזו שפה פותחה על ידי גידו ואן רוסום?",options=["Python","Java","HTML","C++"],correct=1,time=15,points=None),
-      dict(id="q4",type="survey",text="מה הכי חשוב במשחק מוצלח?",options=["האתגר","החברים","האווירה","הניצחון"],correct=None,time=None,points=0),
-      dict(id="q5",type="quiz",text="מהי העיר הגדולה ביותר בישראל לפי אוכלוסייה?",options=["ירושלים","תל אביב־יפו","חיפה","באר שבע"],correct=1,time=None,points=None),
-      dict(id="q6",type="quiz",text="כמה צבעים יש בקשת בענן?",options=["5","6","7"],correct=3,time=15,points=200)
-    ]
+# In-memory high-precision active games state backed by JSON/SQLite files
+ACTIVE_GAMES: Dict[str, Dict[str, Any]] = {}
 
-def fresh():
-    return dict(revision=0, settings=dict(title="ערב טריוויה",defaultTime=20,
-        defaultPoints=100,transition="manual",transitionDelay=5,autoReveal=True,
-        revealDelay=1.2,shuffle=False,maskPhones=False,
-        phoneNumber="077-000-0000",phoneKey=secrets.token_urlsafe(20)),
-        questions=sample_questions(),players=[],scores={},answers={},
-        game=new_game(),history=[])
 
-row = db.execute("SELECT body FROM live WHERE id=1").fetchone()
-S = json.loads(row[0]) if row else fresh()
+def get_player_files(account_id: str, game_id: str):
+    base = DATA_DIR / f"{account_id}_{game_id}"
+    base.mkdir(exist_ok=True)
+    return {
+        "players": base / "players.json",         # קובץ שחקנים
+        "scores": base / "scores.json",           # קובץ ניקוד (נקודות + שניות ואלפיות שנייה)
+        "answered": base / "answered_log.json",   # קובץ נפרד לתיעוד מענה לשאלה הנוכחית למניעת כפילות
+        "history": base / "games_history.json",   # היסטוריית משחקים קודמים
+    }
 
-def ranking(s):
-    return sorted(s["players"], key=lambda p: (
-      -s["scores"].get(p["id"],{}).get("points",0),
-       s["scores"].get(p["id"],{}).get("timeMs",0),p.get("name") or p["id"]))
 
-def summary(s):
-    ranked=ranking(s)
-    top=ranked[0] if ranked else None
-    winner=(top.get("name") or top["id"]) if top and s["scores"].get(top["id"],{}).get("points",0)>0 else "ללא ניקוד"
-    return dict(id=s["game"]["id"],title=s["settings"]["title"],
-        createdAt=s["game"]["createdAt"],endedAt=now(),
-        totalPlayers=len(s["players"]),totalQuestions=len(s["questions"]),winner=winner)
+def read_json(path: Path, default):
+    if path.exists():
+        return json.loads(path.read_text(encoding="utf-8"))
+    return default
 
-def history_summaries():
-    items=[]
-    for (body,) in db.execute("SELECT body FROM history"):
-        item=json.loads(body)
-        items.append({k:v for k,v in item.items() if k!="snapshot"})
-    return sorted(items,key=lambda x:x["endedAt"],reverse=True)
-S["history"]=history_summaries()
 
-def safe_csv(v):
-    if isinstance(v,str) and v.startswith(("=","+","-","@","\t","\r")): return "'"+v
-    return v
+def write_json(path: Path, data):
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
-def atomic_text(path,text):
-    tmp=path.with_suffix(path.suffix+".tmp")
-    tmp.write_text(text,encoding="utf-8")
-    tmp.replace(path)
 
-def csv_write(path,rows):
-    tmp=path.with_suffix(".tmp")
-    with tmp.open("w",encoding="utf-8-sig",newline="") as f:
-        w=csv.writer(f)
-        for row in rows: w.writerow([safe_csv(v) for v in row])
-    tmp.replace(path)
+async def broadcast_game_state(game_code: str, payload: dict):
+    for ws in list(ws_connections.get(game_code, [])):
+        try:
+            await ws.send_json(payload)
+        except Exception:
+            ws_connections[game_code].remove(ws)
 
-def exports(s):
-    directory=DATA/"games"/s["game"]["id"]
-    directory.mkdir(exist_ok=True)
-    rows=[["rank","ApiPhone","name","points","correct_time_ms","correct_count"]]
-    for index,p in enumerate(ranking(s),1):
-        score=s["scores"].get(p["id"],{})
-        rows.append([index,p["id"],p.get("name",""),score.get("points",0),
-                     score.get("timeMs",0),score.get("correct",0)])
-    csv_write(directory/"scores.csv",rows)
-    rows=[["question_id","ApiPhone","answer","correct","elapsed_ms","points","received_at_ms"]]
-    for qid,answers in s["answers"].items():
-        for pid,a in answers.items():
-            rows.append([qid,pid,a["choice"],int(a["correct"]),a["elapsed"],
-                         a["points"],a["at"]])
-    csv_write(directory/"answers.csv",rows)
-    snap={k:v for k,v in s.items() if k!="history"}
-    atomic_text(directory/"game.json",json.dumps(snap,ensure_ascii=False,indent=2))
-    return directory
 
-def persist():
-    # All callers hold LOCK: validation, duplicate prevention and score changes
-    # are serialized. SQLite commits the entire live state atomically.
-    S["revision"]+=1
-    db.execute("INSERT OR REPLACE INTO live VALUES (1,?)",
-               (json.dumps(S,ensure_ascii=False),))
-    db.commit()
-    exports(S)
-    csv_write(DATA/"players.csv",[["ApiPhone","name"]]+[
-        [p["id"],p.get("name","")] for p in S["players"]])
-    atomic_text(DATA/"questions.json",json.dumps(S["questions"],ensure_ascii=False,indent=2))
-    CV.notify_all()
+@app.api_route("/api/phone", methods=["GET", "POST"], response_class=PlainTextResponse)
+async def telephony_ivr_endpoint(
+    request: Request,
+    ApiPhone: Optional[str] = Query(None),
+    game_code: Optional[str] = Query(None),
+    hangup: Optional[str] = Query(None),
+    answer: Optional[str] = Query(None, alias="תשובה"),
+):
+    """
+    נקודת קצה ראשית למערכות טלפוניות (IVR API) ולשלט ה-Web:
+    - ApiPhone: מספר הטלפון / מזהה השחקן
+    - game_code: קוד משחק בן 4 ספרות (אופציונלי אם השחקן קיים בקובץ השחקנים של משחק פעיל)
+    - hangup=yes: מסיר מרשימת המחוברים בזמן אמת אך שומר על הניקוד
+    - תשובה: מספר התשובה (1-4)
+    """
+    params = dict(request.query_params)
+    phone = (ApiPhone or params.get("ApiPhone") or "").strip()
+    code = (game_code or params.get("game_code") or "").strip()
+    is_hangup = (hangup or params.get("hangup") or "").strip().lower() == "yes"
+    ans_raw = answer if answer is not None else params.get("תשובה", params.get("answer"))
 
-def private_view():
-    return bool(session.get("admin")) and request.args.get("audience")!="1"
+    if not phone:
+        return "ERROR"
 
-def view(private=False):
-    s=copy.deepcopy(S)
-    s["serverNow"]=now()
-    if not private:
-        mapping={p["id"]:"p_"+hashlib.sha256(
-            (str(app.secret_key)+p["id"]).encode()).hexdigest()[:16] for p in s["players"]}
-        for p in s["players"]:
-            original=p["id"]
-            shown=original
-            if s["settings"].get("maskPhones") and len(original)>5:
-                shown=original[:3]+"••••"+original[-3:]
-            p["name"]=p.get("name") or shown
-            p["id"]=mapping[original]
-        s["scores"]={mapping[k]:v for k,v in s["scores"].items() if k in mapping}
-        s["answers"]={qid:{mapping[k]:v for k,v in answers.items() if k in mapping}
-                      for qid,answers in s["answers"].items()}
-        s["settings"].pop("phoneKey",None)
-        s["history"]=[]
-        # Correct answers are not sent to the audience before results.
-        for i,q in enumerate(s["questions"]):
-            if i>s["game"]["qIndex"] or (i==s["game"]["qIndex"] and
-                    s["game"]["phase"] not in ("results","finished")):
-                q["correct"]=None
-    return s
+    # 1. איתור המשחק הפעיל לפי game_code או לפי קובץ השחקנים של חשבון עם מסך קהל פעיל
+    target_game = None
+    if code:
+        target_game = ACTIVE_GAMES.get(code)
+        if not target_game or not target_game.get("is_active"):
+            return "UNDEFINED"
+    else:
+        for g in ACTIVE_GAMES.values():
+            if not g.get("is_active"):
+                continue
+            files = get_player_files(g["account_id"], g["game_id"])
+            players_reg = read_json(files["players"], {})
+            if phone in g["connected_phones"] or phone in players_reg:
+                target_game = g
+                break
+        if not target_game:
+            return "UNDEFINED"
 
-def integer(value,low,high,label):
+    files = get_player_files(target_game["account_id"], target_game["game_id"])
+    players_reg = read_json(files["players"], {})
+    scores_file = read_json(files["scores"], {})
+    answered_file = read_json(files["answered"], {})
+
+    # בדיקה אם השחקן קיים בקובץ השחקנים (אם לא - מוצג המספר עצמו מבלי להישמר קבוע בקובץ השחקנים)
+    display_name = players_reg.get(phone, phone)
+
+    # 2. טיפול בניתוק שיחה: hangup=yes
+    if is_hangup:
+        target_game["connected_phones"].pop(phone, None)
+        await broadcast_game_state(target_game["game_code"], {"event": "PLAYER_HANGUP", "phone": phone})
+        return "OK"
+
+    # 3. בקשת התחברות (ללא פרמטר 'תשובה')
+    if ans_raw is None or str(ans_raw).strip() == "":
+        if target_game.get("locked") and phone not in target_game["connected_phones"]:
+            return "ERROR"
+        target_game["connected_phones"][phone] = {
+            "phone": phone,
+            "display_name": display_name,
+            "connected_at": time.time(),
+        }
+        if phone not in scores_file:
+            scores_file[phone] = {"points": 0, "total_correct_time_sec": 0.0, "display_name": display_name}
+            write_json(files["scores"], scores_file)
+
+        await broadcast_game_state(target_game["game_code"], {
+            "event": "PLAYER_CONNECTED",
+            "phone": phone,
+            "display_name": display_name,
+        })
+        return "OK"
+
+    # 4. קליטת תשובה בפרמטר 'תשובה' בזמן טיימר אלפיות שנייה פעיל
+    if not target_game.get("timer_running") or target_game.get("stage") != "question":
+        return "ERROR"
+
+    current_q = target_game.get("current_question")
+    if not current_q:
+        return "ERROR"
+
+    valid_options_count = len([a for a in current_q["answers"] if a and str(a).strip()])
     try:
-        number=float(value)
-        if not number.is_integer() or not low<=number<=high: raise ValueError()
-        return int(number)
-    except (TypeError,ValueError,OverflowError):
-        raise ValueError(label+" אינו תקין")
+        chosen_option = int(str(ans_raw).strip())
+    except ValueError:
+        return "UNDEFINED"
 
-def normalize_id(value):
-    value=str(value or "").strip()
-    if not value or len(value)>64: raise ValueError("נדרש מזהה תקין, עד 64 תווים")
-    return value
+    # אם ענה מספר תשובה שאינה קיימת בשאלה הנוכחית -> מוחזר UNDEFINED וניתנת לו אפשרות לענות תשובה אחרת
+    if chosen_option < 1 or chosen_option > valid_options_count:
+        return "UNDEFINED"
 
-def validate_question(raw):
-    text=str(raw.get("text","")).strip()
-    options=[str(x).strip() for x in raw.get("options",[])]
-    if not text or len(text)>300: raise ValueError("נדרש נוסח שאלה, עד 300 תווים")
-    if len(options) not in (3,4) or any(not x or len(x)>120 for x in options):
-        raise ValueError("נדרשות 3 או 4 תשובות, עד 120 תווים לכל תשובה")
-    kind="survey" if raw.get("type")=="survey" else "quiz"
-    correct=None if kind=="survey" else integer(raw.get("correct"),1,len(options),"מספר תשובה")
-    limit=None if raw.get("time") in (None,"") else integer(raw["time"],1,600,"זמן")
-    points=0 if kind=="survey" else (None if raw.get("points") in (None,"")
-                                  else integer(raw["points"],0,10000,"ניקוד"))
-    return dict(id=str(raw.get("id") or "q_"+secrets.token_hex(6)),text=text,
-                options=options,type=kind,correct=correct,time=limit,points=points)
+    q_id = str(current_q["id"])
+    answered_file.setdefault(q_id, {})
 
-def lobby_only():
-    if S["game"]["phase"]!="lobby":
-        raise ValueError("עריכת שאלות זמינה בלובי. פתחו משחק חדש כדי לשנות את המשחק.")
+    # מניעת כפילות מענה על אותה שאלה בקובץ נפרד
+    if phone in answered_file[q_id]:
+        return "ERROR"
 
-def question():
-    return S["questions"][S["game"]["qIndex"]]
+    elapsed_sec = round(max(0.001, time.perf_counter() - target_game["timer_started_perf"]), 3)
+    correct_num = int(current_q.get("correct", 1))
+    is_correct = (correct_num == 0) or (chosen_option == correct_num)
+    q_points = int(current_q.get("points") or target_game["settings"].get("default_points", 100))
 
-def reveal_question(t):
-    g=S["game"]
-    g.update(phase="reveal",revealed=0,openedAt=None,closedAt=None,
-             pausedAt=None,pauseTotal=0,nextAt=None)
-    g["revealAt"]=t+round(S["settings"]["revealDelay"]*1000) if S["settings"]["autoReveal"] else None
+    # תיעוד המענה בקובץ הנפרד של השאלה הנוכחית
+    answered_file[q_id][phone] = {
+        "phone": phone,
+        "display_name": display_name,
+        "answer": chosen_option,
+        "is_correct": is_correct,
+        "elapsed_sec": elapsed_sec,
+        "points": q_points if is_correct else 0,
+    }
+    write_json(files["answered"], answered_file)
 
-def open_question(t):
-    q=question();g=S["game"]
-    g.update(phase="answering",revealed=len(q["options"]),openedAt=t,
-             pausedAt=None,pauseTotal=0,revealAt=None,nextAt=None,
-             duration=q["time"] if q.get("time") is not None else S["settings"]["defaultTime"],
-             points=(q["points"] if q.get("points") is not None else S["settings"]["defaultPoints"])
-             if q["type"]=="quiz" else 0)
+    scores_file.setdefault(phone, {"points": 0, "total_correct_time_sec": 0.0, "display_name": display_name})
 
-def close_question(t):
-    g=S["game"]
-    g.update(phase="results",closedAt=t,pausedAt=None,revealAt=None)
-    g["nextAt"]=t+S["settings"]["transitionDelay"]*1000 if S["settings"]["transition"]=="auto" else None
+    # שידור בועה מרחפת בזמן אמת למסך הקהל
+    await broadcast_game_state(target_game["game_code"], {
+        "event": "PLAYER_ANSWERED",
+        "phone": phone,
+        "display_name": display_name,
+    })
 
-def step(t):
-    g=S["game"]
-    if g["phase"]=="lobby":
-        if not S["questions"]: raise ValueError("הוסיפו שאלה לפני תחילת המשחק")
-        if S["settings"]["shuffle"]:
-            import random
-            random.shuffle(S["questions"])
-        g["qIndex"]=0
-        reveal_question(t)
-    elif g["phase"]=="reveal":
-        if g["revealed"]<len(question()["options"]):
-            g["revealed"]+=1
-            g["revealAt"]=t+round(S["settings"]["revealDelay"]*1000) if S["settings"]["autoReveal"] else None
-        else: open_question(t)
-    elif g["phase"]=="answering": close_question(t)
-    elif g["phase"]=="results":
-        if g["qIndex"]+1>=len(S["questions"]):
-            g.update(phase="finished",nextAt=None)
-        else:
-            g["qIndex"]+=1
-            reveal_question(t)
+    if is_correct:
+        scores_file[phone]["points"] += q_points
+        scores_file[phone]["total_correct_time_sec"] = round(
+            scores_file[phone]["total_correct_time_sec"] + elapsed_sec, 3
+        )
+        write_json(files["scores"], scores_file)
+        return "בסדר"
+    else:
+        return "ERROR"
 
-def tick(t):
-    g=S["game"]
-    if g["phase"]=="answering" and g["pausedAt"] is None:
-        if t-g["openedAt"]-g["pauseTotal"]>=g["duration"]*1000:
-            close_question(t);return True
-    if g["phase"]=="reveal" and g.get("revealAt") is not None and t>=g["revealAt"]:
-        step(t);return True
-    if g["phase"]=="results" and g.get("nextAt") is not None and t>=g["nextAt"]:
-        step(t);return True
-    return False
 
-def action(kind,p):
-    t=now();g=S["game"]
-    if kind in ("start","step"):
-        if kind=="start" and g["phase"]!="lobby": raise ValueError("המשחק כבר התחיל")
-        step(t)
-    elif kind=="open":
-        if g["phase"]!="reveal": raise ValueError("המענה אינו ניתן לפתיחה כעת")
-        open_question(t)
-    elif kind=="back":
-        if g["phase"]=="reveal":
-            g["revealed"]=max(0,g["revealed"]-1)
-            g["revealAt"]=t+round(S["settings"]["revealDelay"]*1000) if S["settings"]["autoReveal"] else None
-    elif kind=="pause":
-        if g["phase"]!="answering": raise ValueError("אפשר להשהות רק בזמן מענה")
-        if g["pausedAt"] is None: g["pausedAt"]=t
-        else:
-            g["pauseTotal"]+=t-g["pausedAt"]
-            g["pausedAt"]=None
-    elif kind=="finish":
-        g.update(phase="finished",nextAt=None,revealAt=None,pausedAt=None)
-    elif kind=="reset":
-        snap=copy.deepcopy(S);snap.pop("history",None)
-        entry=summary(snap);entry["snapshot"]=snap
-        exports(snap)
-        db.execute("INSERT OR REPLACE INTO history VALUES (?,?)",
-                   (entry["id"],json.dumps(entry,ensure_ascii=False)))
-        S.update(game=new_game(),scores={},answers={})
-        S["history"]=history_summaries()
-    elif kind=="save_question":
-        lobby_only();q=validate_question(p["question"])
-        index=next((i for i,x in enumerate(S["questions"]) if x["id"]==q["id"]),None)
-        if index is None: S["questions"].append(q)
-        else: S["questions"][index]=q
-    elif kind=="delete_question":
-        lobby_only();S["questions"]=[q for q in S["questions"] if q["id"]!=p["id"]]
-    elif kind=="reorder":
-        lobby_only();ids=p["ids"];existing={q["id"]:q for q in S["questions"]}
-        if len(ids)!=len(existing) or set(ids)!=set(existing): raise ValueError("סדר שאלות אינו תקין")
-        S["questions"]=[existing[x] for x in ids]
-    elif kind=="import_questions":
-        lobby_only()
-        if not isinstance(p.get("questions"),list) or len(p["questions"])>1000:
-            raise ValueError("ניתן לייבא עד 1,000 שאלות")
-        questions=[validate_question({**x,"id":"q_"+secrets.token_hex(6)}) for x in p["questions"]]
-        S["questions"]=questions if p.get("replace") else S["questions"]+questions
-    elif kind in ("save_player","import_players"):
-        rows=p["players"] if kind=="import_players" else [p["player"]]
-        if len(rows)>20000: raise ValueError("יותר מדי משתתפים")
-        rows=[dict(id=normalize_id(x.get("id")),name=str(x.get("name","")).strip()[:80]) for x in rows]
-        existing={x["id"]:x for x in S["players"]}
-        for row in rows:
-            if row["id"] in existing: existing[row["id"]]["name"]=row["name"]
-            else:
-                player={**row,"connected":False,"joinedAt":None,"lastSeen":None}
-                S["players"].append(player);existing[row["id"]]=player
-    elif kind=="disconnect":
-        for player in S["players"]:
-            if player["id"]==p["id"]: player["connected"]=False
-    elif kind=="save_settings":
-        raw=p["settings"];settings=copy.deepcopy(S["settings"])
-        title=str(raw.get("title","")).strip()
-        if not title or len(title)>80: raise ValueError("נדרש שם משחק, עד 80 תווים")
-        key=str(raw.get("phoneKey","")).strip()
-        if len(key)<8 or len(key)>128: raise ValueError("מפתח API חייב להכיל 8–128 תווים")
-        settings.update(title=title,phoneKey=key,
-            phoneNumber=str(raw.get("phoneNumber",""))[:40],
-            defaultTime=integer(raw.get("defaultTime"),1,600,"זמן ברירת מחדל"),
-            defaultPoints=integer(raw.get("defaultPoints"),0,10000,"ניקוד ברירת מחדל"),
-            transition="auto" if raw.get("transition")=="auto" else "manual",
-            transitionDelay=integer(raw.get("transitionDelay"),1,60,"זמן מעבר"))
-        try: delay=float(raw.get("revealDelay",1.2))
-        except (ValueError,TypeError): raise ValueError("זמן חשיפה אינו תקין")
-        if not .4<=delay<=10: raise ValueError("זמן החשיפה הוא 0.4–10 שניות")
-        settings["revealDelay"]=delay
-        for flag in ("autoReveal","shuffle","maskPhones"): settings[flag]=bool(raw.get(flag))
-        S["settings"]=settings
-    elif kind in ("delete_history","clear_history"):
-        ids=[p["id"]] if kind=="delete_history" else [h["id"] for h in S["history"]]
-        allowed={h["id"] for h in S["history"]}
-        for game_id in ids:
-            if game_id not in allowed: continue
-            db.execute("DELETE FROM history WHERE id=?",(game_id,))
-            shutil.rmtree(DATA/"games"/game_id,ignore_errors=True)
-        S["history"]=history_summaries()
-    else: raise ValueError("פעולה לא מוכרת")
+@app.post("/api/upload_excel/{account_id}/{game_id}")
+async def upload_questions_from_excel(account_id: str, game_id: str, file: UploadFile = File(...)):
+    """העלאת שאלות מקובץ אקסל (.xlsx / .csv)"""
+    df = pd.read_excel(file.file) if file.filename.endswith((".xlsx", ".xls")) else pd.read_csv(file.file)
+    questions = []
+    for idx, row in df.iterrows():
+        q_text = str(row.get("שאלה", row.iloc[0])).strip()
+        answers = [str(row.iloc[i]).strip() for i in range(1, min(5, len(row))) if pd.notna(row.iloc[i]) and str(row.iloc[i]).strip()]
+        correct = int(row.get("תשובה נכונה", 1)) if pd.notna(row.get("תשובה נכונה", 1)) else 1
+        time_sec = int(row["זמן"]) if "זמן" in row and pd.notna(row["זמן"]) else None
+        pts = int(row["ניקוד"]) if "ניקוד" in row and pd.notna(row["ניקוד"]) else None
+        questions.append({
+            "id": f"q_{int(time.time()*1000)}_{idx}",
+            "text": q_text,
+            "answers": answers,
+            "correct": correct,
+            "time": time_sec,
+            "points": pts,
+        })
+    return JSONResponse({"status": "OK", "imported_count": len(questions), "questions": questions})
 
-@app.get("/")
-def index():
-    if not (ROOT/"index.html").exists():
-        return "Save the downloaded HTML as index.html next to app.py.",500
-    return send_file(ROOT/"index.html")
 
-@app.get("/api/meta")
-def meta():
-    return jsonify(server=True,authenticated=bool(session.get("admin")))
-
-attempts={}
-@app.post("/api/login")
-def login():
-    ip=request.remote_addr or "unknown";t=time.time()
-    attempts[ip]=[v for v in attempts.get(ip,[]) if t-v<60]
-    if len(attempts[ip])>=8: return jsonify(error="נסו שוב בעוד דקה"),429
-    body=request.get_json(silent=True) or {}
-    token=body.get("token","") if isinstance(body,dict) else ""
-    if not secrets.compare_digest(str(token),ADMIN_TOKEN):
-        attempts[ip].append(t)
-        return jsonify(error="מפתח הניהול אינו נכון"),401
-    session.clear();session["admin"]=True;attempts.pop(ip,None)
-    return jsonify(ok=True)
-
-@app.post("/api/logout")
-def logout():
-    session.clear();return jsonify(ok=True)
-
-@app.get("/api/state")
-def get_state():
-    with LOCK: return jsonify(view(private_view()))
-
-@app.get("/api/events")
-def events():
-    private=private_view()
-    @stream_with_context
-    def generate():
-        revision=-1
+@app.websocket("/ws/{game_code}")
+async def game_websocket(websocket: WebSocket, game_code: str):
+    await websocket.accept()
+    ws_connections.setdefault(game_code, []).append(websocket)
+    try:
         while True:
-            with CV:
-                if revision==S["revision"]: CV.wait(timeout=12)
-                changed=revision!=S["revision"]
-                if changed:
-                    body=json.dumps(view(private),ensure_ascii=False)
-                    revision=S["revision"]
-            if changed: yield "data: "+body+"\n\n"
-            else: yield ": heartbeat\n\n"
-    return Response(generate(),mimetype="text/event-stream",
-        headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        ws_connections[game_code].remove(websocket)
 
-@app.post("/api/action")
-def admin_action():
-    if not session.get("admin"): return jsonify(error="נדרשת התחברות מנהל"),401
-    if not request.is_json: return jsonify(error="JSON required"),415
-    body=request.get_json(silent=True) or {}
-    if not isinstance(body,dict): return jsonify(error="בקשה אינה תקינה"),400
-    try:
-        with LOCK:
-            tick(now())
-            action(body.get("type"),body.get("payload") or {})
-            persist()
-            return jsonify(ok=True,state=view(True))
-    except (ValueError,KeyError,TypeError,IndexError) as e:
-        return jsonify(error=str(e)),400
 
-@app.route("/api/phone",methods=["GET","POST"])
-def phone():
-    params=request.args.to_dict()
-    params.update(request.form.to_dict())
-    body=request.get_json(silent=True)
-    if isinstance(body,dict): params.update(body)
-    def reply(text,status=200):
-        return Response(text,status=status,content_type="text/plain; charset=utf-8",
-                        headers={"Cache-Control":"no-store"})
-    with LOCK:
-        if not secrets.compare_digest(str(params.get("key","")),S["settings"]["phoneKey"]):
-            return reply("ERROR",403)
-        try: pid=normalize_id(params.get("ApiPhone"))
-        except ValueError: return reply("ERROR")
-        t=now();tick(t)
-        player=next((x for x in S["players"] if x["id"]==pid),None)
-        if str(params.get("hangup","")).lower()=="yes":
-            if player: player["connected"]=False;player["lastSeen"]=t
-            persist();return reply("בסדר")
-        if not player:
-            player=dict(id=pid,name="",connected=True,joinedAt=t,lastSeen=t)
-            S["players"].append(player)
-        else:
-            if not player["connected"]: player["joinedAt"]=t
-            player["connected"]=True;player["lastSeen"]=t
-        if params.get("תשובה") in (None,""):
-            persist();return reply("בסדר")
-        g=S["game"]
-        if g["phase"]!="answering" or g["pausedAt"] is not None:
-            persist();return reply("ERROR")
-        q=question()
-        try: choice=integer(params["תשובה"],1,len(q["options"]),"תשובה")
-        except ValueError:
-            persist();return reply("ERROR")
-        answers=S["answers"].setdefault(q["id"],{})
-        if pid in answers:
-            persist();return reply("ERROR")
-        elapsed=max(0,t-g["openedAt"]-g["pauseTotal"])
-        if elapsed>=g["duration"]*1000:
-            close_question(t);persist();return reply("ERROR")
-        correct=q["type"]=="quiz" and choice==q["correct"]
-        earned=g["points"] if correct else 0
-        answers[pid]=dict(choice=choice,correct=correct,elapsed=elapsed,points=earned,at=t)
-        if correct:
-            score=S["scores"].setdefault(pid,dict(points=0,timeMs=0,correct=0))
-            score["points"]+=earned;score["timeMs"]+=elapsed;score["correct"]+=1
-        persist()
-        return reply("בסדר" if correct or q["type"]=="survey" else "ERROR")
-
-@app.get("/api/history/<game_id>")
-def history_item(game_id):
-    if not session.get("admin"): return jsonify(error="נדרשת התחברות מנהל"),401
-    with LOCK:
-        row=db.execute("SELECT body FROM history WHERE id=?",(game_id,)).fetchone()
-        if not row: return jsonify(error="המשחק אינו קיים"),404
-        return jsonify(json.loads(row[0])["snapshot"])
-
-@app.get("/api/export")
-def export_file():
-    if not session.get("admin"): return jsonify(error="נדרשת התחברות מנהל"),401
-    game_id=request.args.get("game")
-    kind=request.args.get("kind","scores")
-    if kind not in ("scores","answers"): return jsonify(error="Invalid export"),400
-    with LOCK:
-        if not game_id or game_id==S["game"]["id"]: snap=copy.deepcopy(S)
-        else:
-            row=db.execute("SELECT body FROM history WHERE id=?",(game_id,)).fetchone()
-            if not row: return jsonify(error="המשחק אינו קיים"),404
-            snap=json.loads(row[0])["snapshot"]
-        path=exports(snap)/(kind+".csv")
-        content=path.read_bytes()
-    return Response(content,mimetype="text/csv",
-        headers={"Content-Disposition":f'attachment; filename="{kind}_{snap["game"]["id"]}.csv"'})
-
-def clock_worker():
-    while True:
-        time.sleep(.1)
-        with LOCK:
-            if tick(now()): persist()
-
-with LOCK: persist()
-threading.Thread(target=clock_worker,daemon=True).start()
-
-if __name__=="__main__":
-    print("\nCLICK admin token / מפתח ניהול:\n"+ADMIN_TOKEN)
-    print("\nOpen http://localhost:"+os.environ.get("PORT","5000"))
-    print("Phone API requires a public HTTPS address and the separate phone key.")
-    print("Data and separate scores/answers files are in: "+str(DATA)+"\n")
-    app.run(host=os.environ.get("HOST","127.0.0.1"),
-            port=int(os.environ.get("PORT","5000")),threaded=True,
-            debug=False,use_reloader=False)
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
