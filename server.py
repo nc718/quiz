@@ -20,6 +20,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.get("/")
+async def serve_frontend():
+    return HTMLResponse((Path(__file__).parent / "index.html").read_text(encoding="utf-8"))
+
 DATA_DIR = Path("./game_data")
 DATA_DIR.mkdir(exist_ok=True)
 DB_PATH = DATA_DIR / "clickmaster.sqlite"
